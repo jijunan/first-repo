@@ -1,0 +1,88 @@
+#ifndef __ALL_INIT_H
+#define __ALL_INIT_H
+
+#include "can_bsp.h"
+#include "bsp_dwt.h"
+#include "tim.h"
+#include "usart.h"
+#include "DBUS.h"
+#include "Referee.h"
+#include "cmsis_os.h"
+#include "RUI_ROOT_INIT.h"
+#include "MY_define.h"
+#include "RGBctrl.h"
+#include "bsp_dwt.h"
+#include "DJI_Motor.h"
+#include "IMU_Task.h"
+#include "DM_Motor.h"
+#include "Motors.h"
+#include "can_bsp.h"
+#include "Gimbal_Task.h"
+#include "Shoot_Task.h"
+#include "Chassis_Task.h"
+#include "controller.h"
+#include "Power_CAP.h"
+#include "Power_Ctrl.h"
+#include "bsp_adc.h"
+#include "RobotUI_Ctrl.h"
+#include "Robot.h"
+#include "CANSPI.h"
+#include "MCP2515.h"
+#include "usb_device.h"
+#include "music.h"
+#include "log.h"
+#include "Vision.h"
+#include "VT13.h"
+#include "mahony_filter.h"
+#include "VOFA.h"
+
+void Everying_Init(void);
+extern uint8_t VT13_RX_DATA[21];
+
+extern uint8_t DBUS_RX_DATA[18];
+extern DBUS_Typedef DBUS;
+extern VT13_Typedef VT13;
+
+extern CONTAL_Typedef RUI_V_CONTAL;
+
+extern ALL_RX_Data_T ALL_RX;
+extern User_Data_T User_data;
+
+extern uint8_t RX[20];
+extern  TYPEDEF_VISION VISION_V_DATA;////��ͨ�Ӿ�
+//extern  VisionRxDataUnion VISION_V_DATA ;////��Ԥ���Ӿ�
+extern TD_t TDDDD;
+
+
+extern MOTOR_Typdef ALL_MOTOR;
+
+extern pid_type_def imu_temp;
+
+extern IMU_Data_t IMU_Data;
+
+extern RUI_ROOT_STATUS_Typedef RUI_ROOT_STATUS;
+extern uint8_t sd_v_buff[24];
+//extern uint8_t sd_v_buff[20];
+
+extern uint8_t VisionRx[30];
+
+extern CAPDATE_TYPDEF CAPDATE;
+
+extern float voltage;
+
+extern model_t model;
+
+extern struct CanCommunit_typedef CanCommunit_t;
+
+extern DBUS_UNION_TypeDef RUI_V_DBUS_UNION;
+extern VT13_UNION_Typdef VT13_UNION ;
+
+extern struct gimbal_typedef gimbal_t;
+
+extern float vision_state;
+
+extern float heat_state;
+extern float huanchongnengliang;
+extern uint8_t bulltspeed;
+
+#endif
