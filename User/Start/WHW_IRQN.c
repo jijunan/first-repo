@@ -9,7 +9,6 @@ void StartRobotUITask(void const * argument)
 
     for (;;)
     {
-
     	currentTimeRobotUI += 40;
     	osDelayUntil(currentTimeRobotUI);
 
@@ -24,7 +23,22 @@ void StartMoveTask(void const * argument)
 
     for (;;)
     {
-    DJI_Current_Ctrl(&hcan1,0x200,0,0,400,0);
+    	RobotTask(1,
+			   &DBUS,
+			   &RUI_V_CONTAL,
+			   &User_data,
+			   &CAPDATE,
+			   &VISION_V_DATA/* 普通视觉*/
+							/*	VisionRxDataUnion *Vision 加预测视觉*/,
+			   &RUI_ROOT_STATUS,
+			   &ALL_MOTOR,
+			   &IMU_Data,
+			   &TDDDD,
+			   &VT13);
+    	chassis_task(&RUI_V_CONTAL,
+					 &RUI_ROOT_STATUS,
+					  &User_data,
+					 &ALL_MOTOR);
     	vTaskDelay (1);
     }
 }
@@ -123,6 +137,8 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan)
 			case 0x203:
 				MOTOR_CAN_RX_2006RM(&ALL_MOTOR.DJI_3508_Shoot_M.DATA, rx_data);
 				break;
+			case 0x308:
+			    dm4310_RXdata(&ALL_MOTOR.m_dm4310_y_t,rx_data);
 			default:
 				break;
         }
@@ -133,13 +149,21 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan)
 		//CAN2
 		switch (can_rx.StdId)
 		{
-            case 0x201://摩擦1
-                MOTOR_CAN_RX_3508RM(&ALL_MOTOR.DJI_3508_Shoot_L.DATA, rx_data);
+            case 0x201://底盘1
+                MOTOR_CAN_RX_3508RM(&ALL_MOTOR.DJI_3508_Chassis_1.DATA, rx_data);
                 break;
 
-            case 0x202://摩擦2
-                MOTOR_CAN_RX_3508RM(&ALL_MOTOR.DJI_3508_Shoot_R.DATA, rx_data);
+            case 0x202://底盘2
+                MOTOR_CAN_RX_3508RM(&ALL_MOTOR.DJI_3508_Chassis_2.DATA, rx_data);
                 break;
+
+		    case 0x203://底盘2
+			     MOTOR_CAN_RX_3508RM(&ALL_MOTOR.DJI_3508_Chassis_3.DATA, rx_data);
+			     break;
+
+		    case 0x204://底盘2
+			     MOTOR_CAN_RX_3508RM(&ALL_MOTOR.DJI_3508_Chassis_4.DATA, rx_data);
+			     break;
 			default:
 				break;
         }

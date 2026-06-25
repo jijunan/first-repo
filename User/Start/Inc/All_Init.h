@@ -70,6 +70,8 @@ extern CAPDATE_TYPDEF CAPDATE;
 
 extern float voltage;
 
+extern CAP_RXDATA cap;
+
 extern model_t model;
 
 extern struct CanCommunit_typedef CanCommunit_t;

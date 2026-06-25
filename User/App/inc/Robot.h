@@ -9,7 +9,7 @@
 #include "controller.h"
 #include "VT13.h"
 
-
+#define YawInitialAngle 10200
 
 void RobotTask(uint8_t mode,
                DBUS_Typedef *DBUS,

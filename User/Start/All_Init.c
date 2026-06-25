@@ -41,7 +41,7 @@ model_t model;
 
 uint8_t flag2;
 
-
+CAP_RXDATA cap;
 float vision_state;
 
 DBUS_UNION_TypeDef RUI_V_DBUS_UNION = { 0 };

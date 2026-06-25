@@ -1,11 +1,111 @@
 #include "Robot.h"
+#include <math.h>
+
+#include "All_Init.h"
+
+//==============================================================================
+// 小陀螺 & 陀螺行进 参数
+//==============================================================================
+#define CHASSIS_SPIN_SPEED_DPS   450.0f   // 底盘自旋目标角速度 (deg/s)
+#define CHASSIS_SPIN_KP          10.0f    // 自旋角速度 PID Kp
+#define CHASSIS_SPIN_KI          0.02f    // 自旋角速度 PID Ki
+#define CHASSIS_SPIN_KD          0.0f     // 自旋角速度 PID Kd
+#define CHASSIS_SPIN_PID_MAXOUT  16384.0f  // 自旋 PID 最大输出 (mA)
+#define CHASSIS_SPIN_PID_MAXI    2000.0f  // 自旋 PID 最大积分输出
+
+/* 底盘物理参数 (与 Bottom.c MecanumInit 保持一致) */
+#define CHASSIS_WHEELBASE       300.0f   // 轴距 (mm)
+#define CHASSIS_WHEELTRACK      300.0f   // 轮距 (mm)
+#define CHASSIS_HALF_SUM        ((CHASSIS_WHEELBASE + CHASSIS_WHEELTRACK) / 2.0f)  // (L+R)/2
+/* 旋转项缩放系数: raid = half_sum / 57.3 (= half_sum * π/180), 与 Bottom.c 中 MecanumInit 一致 */
+#define CHASSIS_RAID            (CHASSIS_HALF_SUM / 57.3f)
+
+/* 速度换算系数：遥控器通道 -> mm/s 或 deg/s */
+#define RC_CHASSIS_SPEED_RATIO  10.0f    // 通道 660 满量程 → 约 6600 对应速度单位
+
+/* 自旋 PID 输出→角速度修正换算系数 (mA → deg/s) */
+#define SPIN_PID_WZ_SCALE       (60.0f / CHASSIS_SPIN_PID_MAXOUT)  // 6000mA → 60deg/s 修正
+
+/* 云台自稳 & 位置控制参数 */
+#define GIMBAL_YAW_MIT_KP        80.0f    // MIT 模式位置刚度 Kp
+#define GIMBAL_YAW_MIT_KD        0.8f     // MIT 模式速度阻尼 Kd
+#define GIMBAL_YAW_MAX_DEG       180.0f   // 云台 yaw 机械限位 (度)
+#define GIMBAL_YAW_MIN_DEG       -180.0f
+#define MOUSE_YAW_SCALE          0.02f    // 鼠标 X 速度 → 角度增量系数
+#define GIMBAL_YAW_CAN_ID        0x308    // 云台 yaw DM4310 的 CAN ID
+
 float monitor_X;
 float monitor_Y;
 float monitor_W;
 float yaw_TD;
 float pitch_TD;
-static float counttt=0.0f;
 float VISION_connect;
+
+/* ---- 自旋控制静态变量 ---- */
+static PID_t  chassis_spin_pid;      // 底盘偏航角速度环 PID
+static uint8_t       spin_pid_inited = 0;
+static uint8_t       spin_mode       = 0;  // 0=底盘跟随云台  1=小陀螺(自旋+平移)
+
+/* ---- 底盘跟随模式 PID ---- */
+static PID_t  chassis_follow_pid;    // 底盘跟随云台 yaw 角 PID
+static uint8_t       follow_pid_inited = 0;
+#define CHASSIS_FOLLOW_KP   35.0f   // 跟随比例增益 (将角度误差转为角速度指令)
+#define CHASSIS_FOLLOW_KI   0.0f
+#define CHASSIS_FOLLOW_KD   0.0f
+#define CHASSIS_FOLLOW_MAX  3000.0f   // 跟随 PID 最大输出 (deg/s)
+
+//==============================================================================
+// @brief  麦克纳姆轮运动学解算 — 将云台系速度指令变换到底盘系并解算轮速
+//
+//  输入:
+//    vx_g, vy_g  — 云台坐标系下的平移速度指令 (操作手第一人称视野)
+//                  vx>0=前进, vy>0=右移
+//    wz_dps      — 底盘目标偏航角速度 (deg/s, >0=顺时针)
+//    rel_deg     — 云台相对底盘的偏航角 (deg): rel = θ_gimbal − θ_chassis
+//                  rel>0 表示云台在底盘顺时针方向
+//  输出:
+//    wheel_speed[4] — 四轮目标速度 [RF, LF, LR, RR]，与 Bottom.c 映射一致
+//
+//  坐标系变换原理:
+//    操作手指令 v_g 定义在云台坐标系中（操作手通过图传看到的方向）。
+//    底盘在旋转，需要将 v_g 变换到底盘坐标系才能套用麦轮运动学:
+//
+//      世界系:   v_w = R(θ_g) · v_g           (云台系 → 世界系)
+//      底盘系:   v_c = R(−θ_c) · v_w          (世界系 → 底盘系)
+//
+//    合并:  v_c = R(−θ_c)·R(θ_g)·v_g = R(θ_g − θ_c)·v_g = R(rel)·v_g
+//
+//    其中 R(θ) = [cosθ, −sinθ; sinθ,  cosθ]  (标准二维逆时针旋转)
+//    展开:  vx_c = cos(rel)·vx_g − sin(rel)·vy_g
+//            vy_c = sin(rel)·vx_g + cos(rel)·vy_g
+//
+//  麦轮逆运动学 (与 Bottom.c MecanumResolve 一致):
+//    RF: −Vx + Vy + W_term     LF: +Vx + Vy + W_term
+//    LR: +Vx − Vy + W_term     RR: −Vx − Vy + W_term
+//==============================================================================
+static void Chassis_Resolve(float vx_g, float vy_g,
+                            float wz_dps, float rel_deg,
+                            float wheel_speed[4])
+{
+    float rel_rad = rel_deg * 0.0174532925f;  // deg → rad
+    float cos_r = cosf(rel_rad);
+    float sin_r = sinf(rel_rad);
+
+    /* 云台系 → 底盘系: v_c = R(rel) · v_g */
+    float vx_c = cos_r * vx_g - sin_r * vy_g;
+    float vy_c = sin_r * vx_g + cos_r * vy_g;
+
+    /* 旋转项: wz (deg/s) 转换为平移速度同单位的量
+     * W_term = wz * (L+W)/2 / 57.3°，与 Bottom.c MecanumInit 一致 */
+    float W_term = wz_dps * CHASSIS_RAID;
+
+    /* 麦轮逆运动学 — 符号与 Bottom.c MecanumResolve 一致 */
+    wheel_speed[0] = -vx_c + vy_c + W_term;   // 右前 RF (0x201)
+    wheel_speed[1] =  vx_c + vy_c + W_term;   // 左前 LF (0x202)
+    wheel_speed[2] =  vx_c - vy_c + W_term;   // 左后 LR (0x203)
+    wheel_speed[3] = -vx_c - vy_c + W_term;   // 右后 RR (0x204)
+}
+
 void RobotTask(uint8_t mode,
                DBUS_Typedef *DBUS,
                CONTAL_Typedef *CONTAL,
@@ -21,13 +121,188 @@ void RobotTask(uint8_t mode,
 {
     switch (mode) {
 
-        case 1://底盘
+        case 1: // 底盘
         {
+            /*--------------------------------------------------------------
+             *  底盘模式切换
+             *  S2 == 1 (上位): 底盘跟随云台模式  — 底盘 yaw 跟随云台
+             *  S2 == 3 (中位): 小陀螺模式         — 自旋 + 云台第一人称平移
+             *  S2 == 2 (下位): 小陀螺模式
+             *--------------------------------------------------------------*/
+            spin_mode = (DBUS->Remote.S2 == 3 || DBUS->Remote.S2 == 2) ? 1 : 0;
+
+            /* ---- 首次进入小陀螺模式时初始化自旋 PID ---- */
+            if (spin_mode == 1 && !spin_pid_inited)
+            {
+                float kpid[3] = { CHASSIS_SPIN_KP, CHASSIS_SPIN_KI, CHASSIS_SPIN_KD };
+                PID_Init(&chassis_spin_pid,
+                         CHASSIS_SPIN_PID_MAXOUT,   // max_out
+                         CHASSIS_SPIN_PID_MAXI,     // intergral_limit
+                         kpid,                      // {Kp, Ki, Kd}
+                         0.0f, 0.0f,                // CoefA, CoefB
+                         0.0f,                      // output_lpf_rc
+                         0.0f,                      // derivative_lpf_rc
+                         0,                         // ols_order
+                         Integral_Limit);           // improve
+                spin_pid_inited = 1;
+            }
+
+            /* ---- 首次进入跟随模式时初始化跟随 PID ---- */
+            if (spin_mode == 0 && !follow_pid_inited)
+            {
+                float kpid_follow[3] = { CHASSIS_FOLLOW_KP, CHASSIS_FOLLOW_KI, CHASSIS_FOLLOW_KD };
+                PID_Init(&chassis_follow_pid,
+                         CHASSIS_FOLLOW_MAX,             // max_out
+                         CHASSIS_FOLLOW_MAX * 0.3f,      // intergral_limit
+                         kpid_follow,                    // {Kp, Ki, Kd}
+                         0.0f, 0.0f,                     // CoefA, CoefB
+                         0.0f,                           // output_lpf_rc
+                         0.0f,                           // derivative_lpf_rc
+                         0,                              // ols_order
+                         Integral_Limit);                // improve
+                follow_pid_inited = 1;
+            }
+
+            /* ---- 读取云台相对底盘的偏航角 (单位: 度, float 精度) ----
+             * 来源: DM4310 云台 yaw 电机编码器
+             * rel = θ_gimbal − θ_chassis，rel>0 表示云台在底盘顺时针方向
+             * 两种模式共用: 跟随模式下作为 PID 的被控量；
+             * 小陀螺模式下作为云台系→底盘系旋转矩阵的角度 */
+            float relative_angle = ALL_MOTOR.m_dm4310_y_t.DATA.ralativeAngle;
+            CONTAL->CG.RELATIVE_ANGLE = (int16_t)relative_angle;  // 同步到 CONTAL
+
+            /* ---- 根据模式计算速度指令 (云台坐标系) ---- */
+            float vx_cmd, vy_cmd, wz_cmd;
+
+            if (spin_mode == 0)
+            {
+                /* 底盘跟随模式: 跟随 PID → 底盘角速度指令
+                 * PID_Calculate(measure, ref): error = ref − measure = −relative_angle
+                 * 取反使 wz_cmd 方向正确: rel>0 时底盘朝云台方向旋转 */
+                float follow_raw = PID_Calculate(&chassis_follow_pid,
+                                                 relative_angle, 0.0f);
+                wz_cmd = -follow_raw;
+
+                /* 遥控器摇杆输入 — 操作手通过图传看到的方向 (云台系) */
+                vx_cmd = (float)DBUS->Remote.CH2 * RC_CHASSIS_SPEED_RATIO / 660.0f;
+                vy_cmd = (float)DBUS->Remote.CH3 * RC_CHASSIS_SPEED_RATIO / 660.0f;
+            }
+            else
+            {
+                /* 小陀螺模式: 自旋角速度闭环 PID (deg/s 环)
+                 * 测量值 = IMU gyro[2] (rad/s → deg/s)，目标 = CHASSIS_SPIN_SPEED_DPS
+                 * PID 输出量纲为 mA，通过 SPIN_PID_WZ_SCALE 换算为 deg/s 修正量 */
+                float yaw_rate_dps = IMU_Data->gyro[2] * 57.2957795f;
+                float spin_pid_out = PID_Calculate(&chassis_spin_pid,
+                                                   yaw_rate_dps,
+                                                   CHASSIS_SPIN_SPEED_DPS);
+                wz_cmd = CHASSIS_SPIN_SPEED_DPS + spin_pid_out * SPIN_PID_WZ_SCALE;
+                vx_cmd = (float)DBUS->Remote.CH2 * RC_CHASSIS_SPEED_RATIO / 660.0f;
+                vy_cmd = (float)DBUS->Remote.CH3 * RC_CHASSIS_SPEED_RATIO / 660.0f;
+
+            }
+
+            /* ---- 麦轮逆运动学解算 (云台系 → 底盘系 → 四轮速度) ----
+             * Chassis_Resolve 内部用 R(relative_angle) 将云台系速度旋转到底盘系，
+             * 再套用与 Bottom.c 一致的麦轮逆运动学公式 */
+            float target_wheel[4];
+            Chassis_Resolve(vx_cmd, vy_cmd, wz_cmd, relative_angle, target_wheel);
+
+            /* 存入 CONTAL 供其他模块读取 */
+            CONTAL->BOTTOM.wheel1 = target_wheel[0];
+            CONTAL->BOTTOM.wheel2 = target_wheel[1];
+            CONTAL->BOTTOM.wheel3 = target_wheel[2];
+            CONTAL->BOTTOM.wheel4 = target_wheel[3];
+            CONTAL->BOTTOM.VX    = vx_cmd;
+            CONTAL->BOTTOM.VY    = vy_cmd;
+            CONTAL->BOTTOM.VW    = wz_cmd;
 
         } break;
 
-        case 2://云台
+        case 2: // 云台
         {
+            /*
+             * 云台 Yaw 轴自稳 + 位置控制
+             *
+             * 原理:
+             *   云台 yaw 电机 (DM4310) 安装在底盘上，电机编码器测量的是
+             *   云台相对于底盘的角度。当底盘旋转时，即使云台在世界系中静止，
+             *   编码器读数也会变化。需要用陀螺仪测量的底盘角速度做前馈补偿:
+             *
+             *     vel_ff = −ω_chassis  (rad/s)
+             *
+             *   将此前馈速度送入 MIT 模式，电机内部 PD 环以 10~40kHz 高频
+             *   执行，可快速抵消底盘旋转扰动，保持云台在世界系中稳定。
+             *
+             *   操作手通过鼠标 X 轴控制云台 yaw 目标角度，鼠标速度累积为
+             *   角度增量，经限幅后作为 MIT 位置指令。
+             */
+
+            /* ---- 首次进入时: 初始化 yaw PID + 设置 MIT 模式 ---- */
+            static uint8_t gimbal_yaw_inited = 0;
+            if (!gimbal_yaw_inited)
+            {
+                float kpid[3] = { 15.0f, 0.2f, 0.0f };   // {Kp, Ki, Kd}
+                PID_Init(&ALL_MOTOR.m_dm4310_y_t.PID_P,
+                         500.0f,       // max_out: 最大速度指令 (deg/s)
+                         150.0f,       // integral_limit
+                         kpid,
+                         0.0f, 0.0f,   // CoefA, CoefB
+                         0.0f,         // output_lpf_rc
+                         0.0f,         // derivative_lpf_rc
+                         0,            // ols_order
+                         Integral_Limit);
+
+                /* 设置电机为 MIT 控制模式 (仅需执行一次) */
+                motor_mode(&hcan1, GIMBAL_YAW_CAN_ID, MIT_MODE, DM_CMD_MOTOR_MODE);
+
+                gimbal_yaw_inited = 1;
+            }
+
+            /* ---- 读取当前云台相对底盘的角度 (度, float 精度) ---- */
+            float yaw_current_deg = ALL_MOTOR.m_dm4310_y_t.DATA.ralativeAngle;
+
+            /* ---- 操作手目标角度: 鼠标 X 速度累积 ---- */
+            static float gimbal_yaw_target_deg = 0.0f;
+            static uint8_t target_seeded = 0;
+            if (!target_seeded)
+            {
+                gimbal_yaw_target_deg = yaw_current_deg;  // 以当前位置为起点
+                target_seeded = 1;
+            }
+            gimbal_yaw_target_deg += DBUS->Mouse.X_Flt * MOUSE_YAW_SCALE;
+            gimbal_yaw_target_deg  = MATH_Limit_float(GIMBAL_YAW_MAX_DEG,
+                                                       GIMBAL_YAW_MIN_DEG,
+                                                       gimbal_yaw_target_deg);
+
+            /* ---- 外部位置 PID: 角度误差 → 速度指令 (deg/s) ---- */
+            float yaw_speed_cmd_degps = PID_Calculate(
+                &ALL_MOTOR.m_dm4310_y_t.PID_P,
+                yaw_current_deg,          // measure
+                gimbal_yaw_target_deg);   // ref
+
+            /* ---- 云台自稳: 底盘角速度前馈补偿 ----
+             * 底盘以 ω_c (rad/s) 旋转时，云台电机需以 −ω_c 相对底盘旋转，
+             * 才能在系中保持静止。IMU gyro[2] 即为 ω_c。 */
+            float chassis_wz_rad = IMU_Data->gyro[2];
+            float vel_ff_radps   = -chassis_wz_rad;
+
+            /* 合成为 MIT 速度指令: PID 输出 (deg/s→rad/s) + 前馈 (rad/s) */
+            float total_vel_radps = yaw_speed_cmd_degps * 0.0174532925f + vel_ff_radps;
+
+            /* 目标位置 (rad)，供 MIT 内部 PD 使用 */
+            float target_pos_rad = gimbal_yaw_target_deg * 0.0174532925f;
+
+            /* ---- 通过 MIT 模式下发控制 (若电机在线) ---- */
+            if (Root->MOTOR_HEAD_Yaw == RUI_DF_ONLINE)
+            {
+                mit_ctrl(&hcan1, GIMBAL_YAW_CAN_ID,
+                         target_pos_rad, total_vel_radps,
+                         GIMBAL_YAW_MIT_KP, GIMBAL_YAW_MIT_KD, 0.0f);
+            }
+
+            /* 存入 CONTAL 供其他模块读取 */
+            CONTAL->HEAD.Yaw = gimbal_yaw_target_deg;
 
         } break;
 
