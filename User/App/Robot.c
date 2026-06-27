@@ -200,53 +200,64 @@ void RobotTask(uint8_t mode,
                 wz_cmd = CHASSIS_SPIN_SPEED_DPS + spin_pid_out * SPIN_PID_WZ_SCALE;
                 vx_cmd = (float)DBUS->Remote.CH2 * RC_CHASSIS_SPEED_RATIO / 660.0f;
                 vy_cmd = (float)DBUS->Remote.CH3 * RC_CHASSIS_SPEED_RATIO / 660.0f;
-
                 /* ---- 云台自稳 (小陀螺模式) ----
-                 * 用底盘陀螺仪测量底盘角速度，通过 yaw/pitch 轴电机输出反向角速度，
+                 * 用底盘陀螺仪测量底盘角速度，云台 yaw/pitch 轴电机输出反向运动，
                  * 保证云台相对世界坐标系不变。
                  *
-                 * Yaw:   vel_ff = -gyro[2] (抵消底盘偏航旋转)
-                 * Pitch: vel_ff = -gyro[1] (抵消底盘俯仰旋转，如上坡时防止云台碰到底盘)
+                 * Yaw 轴:
+                 *   位置目标 = 当前相对角度 (跟随操作手意图，不主动改变 yaw 指向)
+                 *   速度前馈 = -gyro[2] (rad/s) → 抵消底盘偏航旋转
                  *
-                 * 首次进入小陀螺模式时初始化 MIT 模式 */
-                static uint8_t gimbal_stab_inited = 0;
+                 * Pitch 轴:
+                 *   位置目标 = motor0 - (IMU_pitch - IMU_pitch0)
+                 *     - 进入小陀螺时记录 IMU 绝对俯仰角 pitch0 和电机初始角 motor0
+                 *     - 底盘上坡 Δθ° → IMU_pitch 增加 Δθ° → 电机目标 = motor0 - Δθ°
+                 *     - 电机反向转动使云台保持水平，MIT Kp 提供对抗重力的保持力矩
+                 *   速度前馈 = -gyro[1] (rad/s) → 抵消底盘俯仰旋转
+                 *
+                 * 控制方式: MIT 模式 — 电机内部 PD 环以 10~40kHz 高频执行
+                 *   力矩 = Kp·(pos_target - pos) + Kd·(vel_target - vel)                */
+                /* ---- 读取传感器数据 ---- */
+                float yaw_current_deg   = ALL_MOTOR.m_dm4310_y_t.DATA.ralativeAngle; // 度
+                float pitch_current_deg = ALL_MOTOR.m_dm4310_p_t.DATA.ralativeAngle; // 度
+                float chassis_wz_radps  = IMU_Data->gyro[2];  // rad/s, 底盘偏航角速度
+                float chassis_wy_radps  = IMU_Data->gyro[1];  // rad/s, 底盘俯仰角速度
+                /* 速度前馈 (rad/s): 电机输出反向角速度抵消底盘旋转 */
+                float yaw_vel_ff_radps   = -chassis_wz_radps;
+                float pitch_vel_ff_radps = -chassis_wy_radps;
+                /* ---- 首次进入时初始化 MIT 模式并记录 pitch 参考值 ---- */
+                static uint8_t  gimbal_stab_inited  = 0;
+                static float    pitch_ref_imu_deg   = 0.0f; // 进入时 IMU 绝对 pitch (度)
+                static float    pitch_ref_motor_deg = 0.0f; // 进入时 pitch 电机相对角 (度)
                 if (!gimbal_stab_inited)
                 {
-                    motor_mode(&hcan1, GIMBAL_YAW_CAN_ID, MIT_MODE, DM_CMD_MOTOR_MODE);
+                    motor_mode(&hcan1, GIMBAL_YAW_CAN_ID,   MIT_MODE, DM_CMD_MOTOR_MODE);
                     motor_mode(&hcan1, GIMBAL_PITCH_CAN_ID, MIT_MODE, DM_CMD_MOTOR_MODE);
-                    gimbal_stab_inited = 1;
+                    pitch_ref_imu_deg   = IMU_Data->pitch;      // 记录初始 IMU 绝对俯仰角 (度)
+                    pitch_ref_motor_deg = pitch_current_deg;     // 记录初始电机相对角 (度)
+                    gimbal_stab_inited  = 1;
                 }
 
-                /* 读取当前云台相对底盘的角度 (度) */
-                float yaw_current_deg   = ALL_MOTOR.m_dm4310_y_t.DATA.ralativeAngle;
-                float pitch_current_deg = ALL_MOTOR.m_dm4310_p_t.DATA.ralativeAngle;
-
-                /* 底盘角速度 (rad/s): gyro[2]=偏航(yaw), gyro[1]=俯仰(pitch) */
-                float chassis_wz_rad = IMU_Data->gyro[2];
-                float chassis_wy_rad = IMU_Data->gyro[1];
-
-                /* 云台自稳: 电机输出反向角速度抵消底盘旋转 */
-                float yaw_vel_ff_radps   = -chassis_wz_rad;
-                float pitch_vel_ff_radps = -chassis_wy_rad;
-
-                /* 目标位置: 保持当前相对角度 (rad)，不引入额外位置控制 */
-                float yaw_target_rad   = yaw_current_deg   * 0.0174532925f;
-                float pitch_target_rad = pitch_current_deg * 0.0174532925f;
-
-                /* 通过 MIT 模式下发 yaw 轴控制 */
+                /* ---- Yaw 轴 MIT 控制: 位置=当前角, 速度=前馈 ---- */
+                float yaw_target_rad = yaw_current_deg * 0.0174532925f;  // deg → rad
                 if (Root->MOTOR_HEAD_Yaw == RUI_DF_ONLINE)
                 {
-                    mit_ctrl(&hcan1, GIMBAL_YAW_CAN_ID,
-                             yaw_target_rad, yaw_vel_ff_radps,
-                             GIMBAL_YAW_MIT_KP, GIMBAL_YAW_MIT_KD, 0.0f);
-                }
+                    PID_Calculate(&MOTOR->m_dm4310_y_t.PID_P,yaw_current_deg,yaw_target_rad);
+                    PID_Calculate(&MOTOR->m_dm4310_y_t.PID_S,yaw_vel_ff_radps,MOTOR->m_dm4310_y_t.PID_P.Output);
+                    mit_ctrl(&hcan1, GIMBAL_YAW_CAN_ID,0, 0,0, 0,MOTOR->m_dm4310_y_t.PID_S.Output );
 
-                /* 通过 MIT 模式下发 pitch 轴控制 */
+                }
+                /* ---- Pitch 轴 MIT 控制: 基于 IMU 绝对俯仰角计算目标位置 ----
+                 * 例: 底盘上坡 15° → IMU pitch 从 2° 变到 17° → Δ = 15°
+                 *      电机目标 = motor0 - 15° → 电机相对底盘转 -15° → 云台保持水平  */
+                float imu_pitch_delta_deg = IMU_Data->pitch - pitch_ref_imu_deg;       // 底盘俯仰变化量 (度)
+                float pitch_target_deg    = pitch_ref_motor_deg - imu_pitch_delta_deg;  // 补偿后目标角 (度)
+                float pitch_target_rad    = pitch_target_deg * 0.0174532925f;           // deg → rad
                 if (Root->MOTOR_HEAD_Pitch == RUI_DF_ONLINE)
                 {
-                    mit_ctrl(&hcan1, GIMBAL_PITCH_CAN_ID,
-                             pitch_target_rad, pitch_vel_ff_radps,
-                             GIMBAL_PITCH_MIT_KP, GIMBAL_PITCH_MIT_KD, 0.0f);
+                    PID_Calculate(&MOTOR->m_dm4310_p_t.PID_P,pitch_current_deg,pitch_target_rad);
+                    PID_Calculate(&MOTOR->m_dm4310_p_t.PID_S,pitch_vel_ff_radps,MOTOR->m_dm4310_p_t.PID_P.Output);
+                    mit_ctrl(&hcan1, GIMBAL_PITCH_CAN_ID,0, 0,0, 0,MOTOR->m_dm4310_p_t.PID_S.Output );
                 }
 
                 /* 存入 CONTAL 供其他模块读取 */
